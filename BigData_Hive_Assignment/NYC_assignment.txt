@@ -1,0 +1,314 @@
+---------- 1.  Create database so I can create tables inside the database only ----------------------
+create database vindb;
+
+
+
+---------- 2.  Run the commands that are asked to be run --------------------------------------------
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+ 
+
+---------- 3.  Create a external table for the data set given including Nov/Dec in a single table ---
+create external table if not exists vindb.nyc(
+VendorID int,
+tpep_pickup_datetime string,
+tpep_dropoff_datetime string,
+passenger_count int,
+trip_distance double,
+RatecodeID int,
+store_and_fwd_flag string,
+PULocationID int,
+DOLocationID int,
+payment_type int,
+fare_amount double,
+extra double,
+mta_tax double,
+tip_amount double,
+tolls_amount double ,
+improvement_surcharge double,
+total_amount double ) 
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+location '/common_folder/nyc_taxi_data/' 
+tblproperties ("skip.header.line.count"="2"); 
+-----------------------------------------------------------------------------------------------------
+
+
+
+
+
+---------- 4.  Basic data quality checks  ------------------------------------------------------------
+--1. How many records has each TPEP provider provided? Write a query that summarises the number of records of each provider.
+select VendorID, count(*) as frequency
+from vindb.nyc
+group by VendorID ;
+
+
+
+--2.The data provided is for months November and December only. Check whether the data is consistent, and if not, identify the data quality issues.
+--  Mention all data quality issues in comments.
+select  VendorID, count(*)
+from vindb.nyc
+where (month(tpep_pickup_datetime)!= 11 and month(tpep_pickup_datetime)!= 12) or year(tpep_pickup_datetime)!= 2017
+group by VendorID;
+
+-- We see that there are records from vendor 2 which are not from year 2017 and nor of nov/dec month, which needs to be cleaned.
+
+
+
+--3.You might have encountered unusual or erroneous rows in the dataset. Can you conclude which vendor is doing a bad job in
+--  providing the records using different  columns of the dataset? Summarise your conclusions based on every column where these
+--  errors are present. For example,  There are unusual passenger count i.e 0 or 192 which is unusual.
+
+select VendorID, count(*) from vindb.nyc 
+where ((month(tpep_pickup_datetime)!= 11 and month(tpep_pickup_datetime)!= 12)
+or   year(tpep_pickup_datetime)!= 2017 )
+or   trip_distance == 0 
+or   (RatecodeID < 1 or RatecodeID >6 )
+or   fare_amount <= 0 
+or   (passenger_count == 0 or passenger_count > 8 ) 
+or   (extra != 0.0 and extra != 1.0 and extra != 0.5 and extra != 1.5)
+or   (mta_tax !=  0.5 and mta_tax != 0.0)
+or   tolls_amount < 0
+or   total_amount <= 0 
+or   improvement_surcharge < 0 
+or   ((payment_type != 1 and tip_amount != 0.0) or (payment_type = 1 and tip_amount < 0.0 and tip_amount > fare_amount))
+group by VendorID ;
+
+
+--- Answer : Vendor 1 has more issues and is doing bad job than Vendor 2.
+
+
+
+
+
+---------- 5. Data Cleaning and filtering  start ------------------------------------------------------------
+----- Have filtered data based on following assumptions  ----
+
+--1. Pickup time           - Should be Nov or December and year 2017
+--2. Drop time             - Should be Nov or December and year 2017
+--3. Trip distance         - Not equal to zero     
+--4. Rate code id          - Should be valid if between 1- 6
+--5. Fare amount           - Ensure it's not negative or 0
+--6. Extra charges         - Based on data dictionary I assume it can be either 0, 0.5 ,1 and 1.5
+--7. mta_tax               - Based on data dictionary I assume it can be either 0  or 0.5 
+--8. Tip amount            - Based on data dictionary I assume for credit card payment it is populated and should be non negative and less than fare amount
+                           -- For non credit card payment, this field has to be 0 as cash tips are not included
+--9. Tolls amount          - Should not be -ve
+--10.Improvement_surcharge - Should not be -ve
+--11.Total amount negative - Should not be -ve
+--12. Passanger count      - I assume anything from 1-8 should be valid. Should not be zero
+
+select count(*)
+from vindb.nyc
+where year(tpep_pickup_datetime)     = 2017 
+and   ( month(tpep_pickup_datetime)  = 11 or month(tpep_pickup_datetime)  = 12)
+and   ( year(tpep_dropoff_datetime)  = 2017)
+and   ( month(tpep_dropoff_datetime) = 11 or month(tpep_dropoff_datetime) = 12)
+and   (passenger_count > 0 and passenger_count <=8)
+and   trip_distance   > 0.0
+and   (RatecodeID      >= 1 and RatecodeID <= 6)
+and   (Store_and_fwd_flag = "Y" or Store_and_fwd_flag = "N")
+and   (payment_type >= 1  and payment_type <= 6)
+and   fare_amount > 0.0
+and   (extra      =  0.0 or extra == 1.0 or  extra = 0.5 or extra = 1.5)
+and   (mta_tax    =  0.5 or mta_tax = 0.0)
+and   improvement_surcharge   >=  0.0
+and  ((payment_type != 1 and tip_amount = 0.0) or (payment_type = 1 and tip_amount >= 0.0 and tip_amount <= fare_amount))
+and   tolls_amount            >=  0.0
+and   total_amount            >   0.0 ;
+
+-----------------------------------------------------------------------------------------------------
+
+
+
+
+
+---------- 6.  Apply above filter to now create a partition table ----------------------------------
+
+------ 1.  Create a partitioned ORC table from nyc table  ------ 
+
+create external table if not exists vindb.nyc_taxi_orc(
+VendorID int,
+tpep_pickup_datetime string,
+tpep_dropoff_datetime string,
+passenger_count int,
+trip_distance double,
+PULocationID int,
+DOLocationID int,
+RatecodeID int,
+store_and_fwd_flag string,
+payment_type int,
+fare_amount double,
+extra double,
+mta_tax double,
+improvement_surcharge double,
+tip_amount double,
+tolls_amount double ,
+total_amount double) 
+partitioned by(mnth int,dy int)
+stored as orc
+location '/user/nayakvinutha_gmail/'
+tblproperties ("orc.compress"="SNAPPY");
+
+
+
+
+
+
+------ 2. Inserting values into the ORC table by filtering the values as we wrote the select earlier -------------------
+Insert overwrite table vindb.nyc_taxi_orc 
+partition(mnth,dy)
+Select VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count, trip_distance, PULocationID,
+       DOLocationID, RatecodeID, store_and_fwd_flag, payment_type, fare_amount, extra, mta_tax,
+       improvement_surcharge, tip_amount, tolls_amount, total_amount, 
+       month(tpep_pickup_datetime)as mnth, day(tpep_pickup_datetime)as dy 
+from vindb.nyc
+where year(tpep_pickup_datetime)     = 2017 
+and   ( month(tpep_pickup_datetime)  = 11 or month(tpep_pickup_datetime)  = 12)
+and   ( year(tpep_dropoff_datetime)  = 2017)
+and   ( month(tpep_dropoff_datetime) = 11 or month(tpep_dropoff_datetime) = 12)
+and   (passenger_count > 0 and passenger_count <=8)
+and   trip_distance   > 0.0
+and   (RatecodeID      >= 1 and RatecodeID <= 6)
+and   (Store_and_fwd_flag = "Y" or Store_and_fwd_flag = "N")
+and   (payment_type >= 1  and payment_type <= 6)
+and   fare_amount > 0.0
+and   (extra      =  0.0 or extra == 1.0 or  extra = 0.5 or extra = 1.5)
+and   (mta_tax    =  0.5 or mta_tax = 0.0)
+and   improvement_surcharge   >=  0.0
+and  ((payment_type != 1 and tip_amount = 0.0) or (payment_type = 1 and tip_amount >= 0.0 and tip_amount <= fare_amount))
+and   tolls_amount            >=  0.0
+and   total_amount            >   0.0 ;
+
+
+
+
+------ 3. Confirming number of rows after paritioning as it's base table for all queries hence on 
+select count(*)
+from vindb.nyc_taxi_orc;
+
+-----------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+---------- 7.  Analysis - I  ------------------------------------------------------------------------
+
+------  1.Compare the overall average fare per trip for November and December.
+
+Select mnth as Month_of_year , avg(fare_amount) as Average_fare_per_trip
+from vindb.nyc_taxi_orc
+group by mnth;
+
+
+
+
+------  2.Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’? 
+------    Do most people travel solo or with other people ?
+
+Select passenger_count, count(*) as number_of_trips
+from vindb.nyc_taxi_orc
+group by passenger_count
+order by passenger_count asc;
+
+-----  Answer:  Yes, most people travel solo.
+
+
+
+
+------  3. Which is the most preferred mode of payment?
+Select payment_type, count(*) as number_of_payments
+from vindb.nyc_taxi_orc
+group by payment_type 
+order by number_of_payments desc limit 1;
+
+-----  Answer:  Credit card is the most preffered payment type.
+
+
+
+
+
+
+------  4. What is the average tip paid per trip?
+--         Compare the average tip with the 25th, 50th and 75th percentilepers and comment whether the ‘average tip’ is a representative statistic (of the central tendency) of ‘tip amount paid’. 
+--         Hint: You may use percentile_approx(DOUBLE col, p): Returns an approximate pth percentile of a numeric column (including floating point types) in the group.
+Select avg(tip_amount) as average_tip_amount, percentile_approx(tip_amount, 0.25) as 25th_percentile,
+       percentile_approx(tip_amount, 0.50) as 50th_percentile, percentile_approx(tip_amount, 0.75) as 75th_percentile
+from vindb.nyc_taxi_orc ;
+
+-----  Answer: 1.821 is the average tip. Yes, it's representative statistic. 
+
+
+
+
+------ 5. Explore the ‘Extra’ (charge) variable - what fraction of total trips have an extra charge is levied?
+select   a.trip_with_extracharge/b.total_trips as fraction_of_total_trips 
+from 
+       (select count(*) as trip_with_extracharge
+       from vindb.nyc_taxi_orc where extra != 0.0 ) a,
+       (select count(*) as total_trips 
+       from vindb.nyc_taxi_orc) b;
+       
+
+
+
+---------- 8.  Analysis - II  ------------------------------------------------------------------------------
+
+------ 1. What is the correlation between the number of passengers on any given trip, and the tip paid per trip? Do multiple travellers tip 
+--        more compared to solo travellers? Hint: Use CORR(Col_1, Col_2)
+select CORR(passenger_count,tip_amount)
+from vindb.nyc_taxi_orc;
+
+-- Answer : -0.004862478486510469. We see a negative co-relation, however it is almost zero, hence we can't define a pattern or say with
+--           confidence that multiple travellers pay more tip than solo travellers.
+
+
+
+
+
+------ 2. Segregate the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20. Calculate the percentage share of 
+--     each bucket (i.e. the fraction of trips falling in each bucket).
+
+select b.tip_bucket, b.frequency, b.frequency/c.total_trips as ratio
+from 
+(select a.tip_bucket, count(*) as frequency
+ from 
+   ( select tip_amount,
+     CASE when tip_amount >= 0 and tip_amount <5 then 'Bucket_1'
+     when tip_amount >=5 and tip_amount < 10 then     'Bucket_2'
+     when tip_amount >=10 and tip_amount < 15 then    'Bucket_3'
+     when tip_amount >=15 and tip_amount < 20 then    'Bucket_4'
+     else 'Bucket_5'
+     end as tip_bucket
+     from vindb.nyc_taxi_orc
+   )a
+ group by a.tip_bucket) b,
+ (select count(*) as total_trips
+  from vindb.nyc_taxi_orc
+ )c
+sort by tip_bucket asc;
+
+
+------ 3. Which month has a greater average ‘speed’ - November or December? Note that the variable ‘speed’ will have to be derived from other
+--        metrics. Hint: You have columns for distance and time.
+select mnth as month, avg( trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600)) as avg_speed_mile_per_hour
+from  vindb.nyc_taxi_orc
+group by mnth;
+
+-- Answer : Average Speeds are almost equal  for November and December.
+
+
+
+------ 4. Analyse the average speed of the most happening days of the year, i.e. 31st December (New year’s eve) and 25th December (Christmas Eve)
+--        and compare it with the overall average. 
+select  avg(case when mnth=12 and dy=25 then (trip_distance/((unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600)) end) as dec25_avg_speed,
+        avg(case when mnth=12 and dy=31 then (trip_distance/((unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600)) end) as newyear_avg_speed,
+        avg(trip_distance / ((unix_timestamp(tpep_dropoff_datetime)- unix_timestamp(tpep_pickup_datetime))/3600)) as overall_avg_speed
+from vindb.nyc_taxi_orc;
+-----------------------------------------------------------------------------------------------------
